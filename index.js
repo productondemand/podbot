@@ -8,6 +8,7 @@ const fetch = require('node-fetch');
 const CONFIG = {
   microsoftAppId: process.env.MICROSOFT_APP_ID || '',
   microsoftAppPassword: process.env.MICROSOFT_APP_PASSWORD || '',
+  microsoftAppTenantId: process.env.MICROSOFT_APP_TENANT_ID || '',
   n8nBaseUrl: process.env.N8N_WEBHOOK_BASE_URL || 'https://n8n.productondemand.co',
   port: process.env.PORT || 3978,
   // Add your n8n workflows here. Each needs a webhook trigger in n8n.
@@ -68,6 +69,9 @@ if (CONFIG.workflows.length === 0) {
 const adapter = new BotFrameworkAdapter({
   appId: CONFIG.microsoftAppId,
   appPassword: CONFIG.microsoftAppPassword,
+  appTenantId: CONFIG.microsoftAppTenantId,
+  channelService: 'https://botframework.com',
+  oAuthEndpoint: `https://login.microsoftonline.com/${CONFIG.microsoftAppTenantId}`,
 });
 
 adapter.onTurnError = async (context, error) => {
