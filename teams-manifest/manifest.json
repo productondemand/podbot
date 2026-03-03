@@ -1,0 +1,50 @@
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "{{MICROSOFT_APP_ID}}",
+  "developer": {
+    "name": "ProductOnDemand",
+    "websiteUrl": "https://productondemand.co",
+    "privacyUrl": "https://productondemand.co/privacy",
+    "termsOfUseUrl": "https://productondemand.co/terms"
+  },
+  "name": {
+    "short": "POD Bot",
+    "full": "POD Command Center"
+  },
+  "description": {
+    "short": "Personal workflow bot for n8n",
+    "full": "Run n8n workflows directly from Teams with interactive buttons and menus. Personal use only."
+  },
+  "icons": {
+    "color": "color.png",
+    "outline": "outline.png"
+  },
+  "accentColor": "#4F46E5",
+  "bots": [
+    {
+      "botId": "{{MICROSOFT_APP_ID}}",
+      "scopes": ["personal"],
+      "supportsFiles": false,
+      "isNotificationOnly": false,
+      "commandLists": [
+        {
+          "scopes": ["personal"],
+          "commands": [
+            {
+              "title": "menu",
+              "description": "Show the workflow menu"
+            },
+            {
+              "title": "help",
+              "description": "Get help"
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": []
+}

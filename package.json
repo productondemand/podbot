@@ -1,0 +1,14 @@
+{
+  "name": "pod-teams-bot",
+  "version": "1.0.0",
+  "description": "Personal Teams bot for triggering n8n workflows",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "botbuilder": "^4.22.0",
+    "restify": "^11.1.0",
+    "node-fetch": "^2.7.0"
+  }
+}
