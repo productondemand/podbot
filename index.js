@@ -1,28 +1,45 @@
-const {
-  CloudAdapter,
-  ConfigurationBotFrameworkAuthentication,
-  CardFactory,
-} = require('botbuilder');
+const { BotFrameworkAdapter, CardFactory, MessageFactory } = require('botbuilder');
 const restify = require('restify');
 const fetch = require('node-fetch');
 
 // ============================================================
-// CONFIG
+// CONFIG — supports both naming conventions for App ID/Password
 // ============================================================
-const n8nBaseUrl = process.env.N8N_WEBHOOK_BASE_URL || 'https://n8n.productondemand.co';
-const port = process.env.PORT || 3978;
-let workflows = [];
-try {
-  workflows = JSON.parse(process.env.WORKFLOWS || '[]');
-} catch (e) {
-  workflows = [];
-}
+const CONFIG = {
+  // Support both MICROSOFT_APP_ID and MicrosoftAppId (Bot Framework standard)
+  microsoftAppId:
+    process.env.MicrosoftAppId ||
+    process.env.MICROSOFT_APP_ID ||
+    '',
+  microsoftAppPassword:
+    process.env.MicrosoftAppPassword ||
+    process.env.MICROSOFT_APP_PASSWORD ||
+    '',
+  microsoftAppType:
+    process.env.MicrosoftAppType || 'MultiTenant',
+  n8nBaseUrl:
+    process.env.N8N_WEBHOOK_BASE_URL || 'https://n8n.productondemand.co',
+  hubPath:
+    process.env.N8N_HUB_PATH || '/webhook/teams-bot-hub',
+  ollamaModel:
+    process.env.OLLAMA_MODEL || 'llama3.1:8b',
+  port: process.env.PORT || 3978,
+  workflows: JSON.parse(process.env.WORKFLOWS || '[]'),
+};
 
 // ============================================================
 // DEFAULT WORKFLOWS
 // ============================================================
-if (workflows.length === 0) {
-  workflows = [
+if (CONFIG.workflows.length === 0) {
+  CONFIG.workflows = [
+    {
+      id: 'task-reminder',
+      name: '📋 Task Reminders',
+      description: 'Check overdue and upcoming tasks',
+      webhookPath: '/webhook/teams-bot-hub',
+      hubAction: 'reminder',
+      category: 'Tasks',
+    },
     {
       id: 'daily-report',
       name: '📊 Daily Report',
@@ -31,55 +48,33 @@ if (workflows.length === 0) {
       category: 'Reports',
     },
     {
-      id: 'crm-update',
-      name: '📇 CRM Quick Update',
-      description: 'Log a quick CRM update for a client',
-      webhookPath: '/webhook/teams-crm-update',
-      category: 'CRM',
-      inputs: ['client_name', 'update_note'],
-    },
-    {
-      id: 'send-followup',
-      name: '📧 Send Follow-up',
-      description: 'Trigger follow-up email workflow',
-      webhookPath: '/webhook/teams-followup',
-      category: 'Email',
-      inputs: ['recipient', 'context'],
-    },
-    {
-      id: 'check-pipeline',
-      name: '💰 Pipeline Status',
-      description: 'Check deal pipeline across clients',
-      webhookPath: '/webhook/teams-pipeline',
-      category: 'Reports',
-    },
-    {
-      id: 'task-create',
-      name: '✅ Create Task',
-      description: 'Create a task in Zoho Projects',
-      webhookPath: '/webhook/teams-task',
-      category: 'Tasks',
-      inputs: ['project', 'task_title', 'assignee'],
+      id: 'ask-ollama',
+      name: '🤖 Ask AI',
+      description: 'Ask a question to the AI assistant',
+      webhookPath: '/webhook/teams-bot-hub',
+      hubAction: 'ollama_query',
+      category: 'AI',
+      inputs: ['question'],
     },
   ];
 }
 
 // ============================================================
-// BOT ADAPTER — CloudAdapter for single-tenant support
-// CloudAdapter reads these env vars automatically:
-//   MicrosoftAppType=SingleTenant
-//   MicrosoftAppId=<your app id>
-//   MicrosoftAppPassword=<your client secret>
-//   MicrosoftAppTenantId=<your tenant id>
+// BOT ADAPTER
 // ============================================================
-const botFrameworkAuth = new ConfigurationBotFrameworkAuthentication(process.env);
-const adapter = new CloudAdapter(botFrameworkAuth);
+const adapter = new BotFrameworkAdapter({
+  appId: CONFIG.microsoftAppId,
+  appPassword: CONFIG.microsoftAppPassword,
+});
 
 adapter.onTurnError = async (context, error) => {
-  console.error(`[Bot Error] ${error.message}`);
-  console.error(error.stack);
+  console.error(`[Bot Error] ${error.message}\n${error.stack}`);
   await context.sendActivity('⚠️ Something went wrong. Please try again.');
 };
+
+console.log(`[Config] AppId: ${CONFIG.microsoftAppId ? CONFIG.microsoftAppId.substring(0, 8) + '...' : 'NOT SET'}`);
+console.log(`[Config] AppType: ${CONFIG.microsoftAppType}`);
+console.log(`[Config] Hub: ${CONFIG.n8nBaseUrl}${CONFIG.hubPath}`);
 
 // ============================================================
 // STATE
@@ -88,9 +83,84 @@ const userState = {};
 
 function getUserState(userId) {
   if (!userState[userId]) {
-    userState[userId] = { pendingWorkflow: null, pendingInputs: {}, inputStep: 0 };
+    userState[userId] = {
+      pendingWorkflow: null,
+      pendingInputs: {},
+      inputStep: 0,
+      conversationHistory: [], // for future multi-turn Ollama conversations
+    };
   }
   return userState[userId];
+}
+
+// ============================================================
+// HUB CALLER — all actions go through the Teams Bot Hub
+// ============================================================
+
+async function callHub(payload) {
+  const url = `${CONFIG.n8nBaseUrl}${CONFIG.hubPath}`;
+  console.log(`[Hub] Calling ${url} with action: ${payload.action}`);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+      timeout: 120000, // 2 min for Ollama responses
+    });
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`Hub returned ${response.status}: ${text}`);
+    }
+
+    return await response.json();
+  } catch (err) {
+    console.error(`[Hub Error] ${err.message}`);
+    return { success: false, error: err.message };
+  }
+}
+
+async function callN8nWorkflow(workflow, inputs = {}) {
+  // If workflow routes through the hub, use callHub
+  if (workflow.hubAction) {
+    const payload = {
+      action: workflow.hubAction,
+      reply_to_teams: false, // bot handles reply itself
+      ...inputs,
+    };
+    if (workflow.hubAction === 'ollama_query') {
+      payload.prompt = inputs.question || inputs.prompt || '';
+      payload.model = CONFIG.ollamaModel;
+    }
+    return await callHub(payload);
+  }
+
+  // Direct n8n webhook call for non-hub workflows
+  const url = `${CONFIG.n8nBaseUrl}${workflow.webhookPath}`;
+  console.log(`[n8n] Calling: ${url}`);
+
+  try {
+    const response = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        source: 'teams-bot',
+        workflowId: workflow.id,
+        timestamp: new Date().toISOString(),
+        ...inputs,
+      }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`n8n returned ${response.status}: ${response.statusText}`);
+    }
+
+    return await response.json();
+  } catch (err) {
+    console.error(`[n8n Error] ${err.message}`);
+    return { error: true, message: `Failed to run workflow: ${err.message}` };
+  }
 }
 
 // ============================================================
@@ -99,20 +169,31 @@ function getUserState(userId) {
 
 function buildMainMenuCard() {
   const categories = {};
-  workflows.forEach((wf) => {
+  CONFIG.workflows.forEach((wf) => {
     const cat = wf.category || 'General';
     if (!categories[cat]) categories[cat] = [];
     categories[cat].push(wf);
   });
 
   const body = [
-    { type: 'TextBlock', text: '🤖 POD Command Center', weight: 'Bolder', size: 'Large' },
-    { type: 'TextBlock', text: 'Select a workflow to run:', wrap: true, spacing: 'Small' },
+    {
+      type: 'TextBlock',
+      text: '🤖 POD Command Center',
+      weight: 'Bolder',
+      size: 'Large',
+    },
+    {
+      type: 'TextBlock',
+      text: 'Select a workflow — or just type any question to ask the AI.',
+      wrap: true,
+      spacing: 'Small',
+      isSubtle: true,
+    },
   ];
 
   const actions = [];
 
-  Object.entries(categories).forEach(([category, wfs]) => {
+  Object.entries(categories).forEach(([category, workflows]) => {
     body.push({
       type: 'TextBlock',
       text: category,
@@ -121,7 +202,8 @@ function buildMainMenuCard() {
       spacing: 'Medium',
       separator: true,
     });
-    wfs.forEach((wf) => {
+
+    workflows.forEach((wf) => {
       actions.push({
         type: 'Action.Submit',
         title: wf.name,
@@ -145,53 +227,126 @@ function buildInputCard(workflow, inputField, stepIndex, totalSteps) {
     type: 'AdaptiveCard',
     version: '1.4',
     body: [
-      { type: 'TextBlock', text: `${workflow.name} — Step ${stepIndex + 1} of ${totalSteps}`, weight: 'Bolder', size: 'Medium' },
-      { type: 'TextBlock', text: `Enter **${inputField.replace(/_/g, ' ')}**:`, wrap: true },
-      { type: 'Input.Text', id: 'inputValue', placeholder: `Type ${inputField.replace(/_/g, ' ')} here...` },
+      {
+        type: 'TextBlock',
+        text: `${workflow.name} — Step ${stepIndex + 1} of ${totalSteps}`,
+        weight: 'Bolder',
+        size: 'Medium',
+      },
+      {
+        type: 'TextBlock',
+        text: `Enter **${inputField.replace(/_/g, ' ')}**:`,
+        wrap: true,
+      },
+      {
+        type: 'Input.Text',
+        id: 'inputValue',
+        placeholder: `Type ${inputField.replace(/_/g, ' ')} here...`,
+        isMultiline: inputField === 'question' || inputField === 'context' || inputField === 'update_note',
+      },
     ],
     actions: [
-      { type: 'Action.Submit', title: 'Submit', data: { action: 'submit_input', workflowId: workflow.id, inputField } },
-      { type: 'Action.Submit', title: '❌ Cancel', data: { action: 'cancel' } },
+      {
+        type: 'Action.Submit',
+        title: 'Submit',
+        data: { action: 'submit_input', workflowId: workflow.id, inputField },
+      },
+      {
+        type: 'Action.Submit',
+        title: '❌ Cancel',
+        data: { action: 'cancel' },
+      },
     ],
   });
 }
 
 function buildResultCard(workflowName, result) {
-  const resultText = typeof result === 'string' ? result : JSON.stringify(result, null, 2);
+  // Extract the best text from the result
+  let resultText = '';
+
+  if (result.ollamaResponse) {
+    resultText = result.ollamaResponse;
+  } else if (result.message) {
+    resultText = result.message;
+  } else if (typeof result === 'string') {
+    resultText = result;
+  } else if (result.error) {
+    resultText = `❌ Error: ${result.error || result.reason || 'Unknown error'}`;
+  } else {
+    resultText = JSON.stringify(result, null, 2);
+  }
+
   return CardFactory.adaptiveCard({
     $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
     type: 'AdaptiveCard',
     version: '1.4',
     body: [
-      { type: 'TextBlock', text: `✅ ${workflowName}`, weight: 'Bolder', size: 'Medium', color: 'Good' },
-      { type: 'TextBlock', text: resultText.substring(0, 2000), wrap: true, fontType: 'Default' },
+      {
+        type: 'TextBlock',
+        text: `✅ ${workflowName}`,
+        weight: 'Bolder',
+        size: 'Medium',
+        color: result.error ? 'Attention' : 'Good',
+      },
+      {
+        type: 'TextBlock',
+        text: resultText.substring(0, 3000),
+        wrap: true,
+      },
     ],
     actions: [
-      { type: 'Action.Submit', title: '🏠 Back to Menu', data: { action: 'menu' } },
+      {
+        type: 'Action.Submit',
+        title: '🏠 Back to Menu',
+        data: { action: 'menu' },
+      },
     ],
   });
 }
 
-// ============================================================
-// N8N WEBHOOK CALLER
-// ============================================================
-
-async function callN8nWorkflow(workflow, inputs = {}) {
-  const url = `${n8nBaseUrl}${workflow.webhookPath}`;
-  console.log(`[n8n] Calling: ${url}`, inputs);
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ source: 'teams-bot', workflowId: workflow.id, timestamp: new Date().toISOString(), ...inputs }),
-    });
-    if (!response.ok) throw new Error(`n8n returned ${response.status}: ${response.statusText}`);
-    const data = await response.json();
-    return data;
-  } catch (err) {
-    console.error(`[n8n Error] ${err.message}`);
-    return { error: true, message: `Failed to run workflow: ${err.message}` };
-  }
+function buildOllamaCard(question, answer, model) {
+  return CardFactory.adaptiveCard({
+    $schema: 'http://adaptivecards.io/schemas/adaptive-card.json',
+    type: 'AdaptiveCard',
+    version: '1.4',
+    body: [
+      {
+        type: 'TextBlock',
+        text: '🤖 AI Response',
+        weight: 'Bolder',
+        size: 'Medium',
+        color: 'Accent',
+      },
+      {
+        type: 'TextBlock',
+        text: `**You asked:** ${question.substring(0, 200)}`,
+        wrap: true,
+        isSubtle: true,
+        size: 'Small',
+      },
+      {
+        type: 'TextBlock',
+        text: answer.substring(0, 3000),
+        wrap: true,
+        spacing: 'Medium',
+      },
+      {
+        type: 'TextBlock',
+        text: `_Model: ${model || 'llama3.1:8b'}_`,
+        wrap: true,
+        isSubtle: true,
+        size: 'Small',
+        spacing: 'Small',
+      },
+    ],
+    actions: [
+      {
+        type: 'Action.Submit',
+        title: '🏠 Menu',
+        data: { action: 'menu' },
+      },
+    ],
+  });
 }
 
 // ============================================================
@@ -201,11 +356,13 @@ async function callN8nWorkflow(workflow, inputs = {}) {
 async function handleMessage(context) {
   const userId = context.activity.from.id;
   const state = getUserState(userId);
-  const text = (context.activity.text || '').trim().toLowerCase();
+  const rawText = (context.activity.text || '').trim();
+  const text = rawText.toLowerCase();
   const cardData = context.activity.value;
 
+  // --- Handle Adaptive Card button clicks ---
   if (cardData) {
-    const { action, workflowId, inputField } = cardData;
+    const { action, workflowId } = cardData;
 
     if (action === 'menu' || action === 'cancel') {
       state.pendingWorkflow = null;
@@ -216,14 +373,19 @@ async function handleMessage(context) {
     }
 
     if (action === 'run_workflow') {
-      const workflow = workflows.find((w) => w.id === workflowId);
-      if (!workflow) { await context.sendActivity('⚠️ Workflow not found.'); return; }
+      const workflow = CONFIG.workflows.find((w) => w.id === workflowId);
+      if (!workflow) {
+        await context.sendActivity('⚠️ Workflow not found.');
+        return;
+      }
 
       if (workflow.inputs && workflow.inputs.length > 0) {
         state.pendingWorkflow = workflow;
         state.pendingInputs = {};
         state.inputStep = 0;
-        await context.sendActivity({ attachments: [buildInputCard(workflow, workflow.inputs[0], 0, workflow.inputs.length)] });
+        await context.sendActivity({
+          attachments: [buildInputCard(workflow, workflow.inputs[0], 0, workflow.inputs.length)],
+        });
         return;
       }
 
@@ -235,14 +397,19 @@ async function handleMessage(context) {
 
     if (action === 'submit_input') {
       const workflow = state.pendingWorkflow;
-      if (!workflow) { await context.sendActivity({ attachments: [buildMainMenuCard()] }); return; }
+      if (!workflow) {
+        await context.sendActivity({ attachments: [buildMainMenuCard()] });
+        return;
+      }
 
       state.pendingInputs[cardData.inputField] = cardData.inputValue;
       state.inputStep++;
 
       if (state.inputStep < workflow.inputs.length) {
         const nextInput = workflow.inputs[state.inputStep];
-        await context.sendActivity({ attachments: [buildInputCard(workflow, nextInput, state.inputStep, workflow.inputs.length)] });
+        await context.sendActivity({
+          attachments: [buildInputCard(workflow, nextInput, state.inputStep, workflow.inputs.length)],
+        });
         return;
       }
 
@@ -256,13 +423,37 @@ async function handleMessage(context) {
     }
   }
 
-  if (['menu', 'help', 'hi', 'hello', 'start'].includes(text)) {
+  // --- Handle text commands ---
+  if (text === 'menu' || text === 'help' || text === 'start') {
     await context.sendActivity({ attachments: [buildMainMenuCard()] });
     return;
   }
 
-  await context.sendActivity("👋 Hey Vivek! Type **menu** or tap a button below to get started.");
-  await context.sendActivity({ attachments: [buildMainMenuCard()] });
+  if (text === 'hi' || text === 'hello') {
+    await context.sendActivity("👋 Hey Vivek! Type a question to ask the AI, or type **menu** to see workflows.");
+    return;
+  }
+
+  // --- Default: treat any free-text as an Ollama question ---
+  await context.sendActivity(`⏳ Thinking...`);
+
+  const hubResult = await callHub({
+    action: 'ollama_query',
+    prompt: rawText,
+    model: CONFIG.ollamaModel,
+    reply_to_teams: false,
+    system: 'You are a helpful AI assistant for Vivek at ProductOnDemand, a product consulting firm. Answer concisely and clearly.',
+  });
+
+  if (hubResult.ollamaResponse) {
+    await context.sendActivity({
+      attachments: [buildOllamaCard(rawText, hubResult.ollamaResponse, hubResult.model_used)],
+    });
+  } else {
+    await context.sendActivity(
+      `⚠️ Couldn't get a response: ${hubResult.error || 'Hub did not return an Ollama answer. Make sure the Teams Bot Hub workflow is active and returning ollamaResponse.'}`
+    );
+  }
 }
 
 // ============================================================
@@ -277,20 +468,21 @@ server.post('/api/messages', async (req, res) => {
     if (context.activity.type === 'message') {
       await handleMessage(context);
     } else if (context.activity.type === 'conversationUpdate') {
-      if (context.activity.membersAdded && context.activity.membersAdded.some((m) => m.id !== context.activity.recipient.id)) {
-        await context.sendActivity("👋 Welcome to the **POD Command Center**! I'm your personal workflow bot.");
+      if (
+        context.activity.membersAdded &&
+        context.activity.membersAdded.some((m) => m.id !== context.activity.recipient.id)
+      ) {
+        await context.sendActivity("👋 Welcome to the **POD Command Center**! Type a question to ask the AI, or type **menu** to see workflows.");
         await context.sendActivity({ attachments: [buildMainMenuCard()] });
       }
     }
   });
 });
 
-server.listen(port, () => {
-  console.log(`\n🤖 POD Teams Bot running on port ${port}`);
-  console.log(`   Endpoint: http://localhost:${port}/api/messages`);
-  console.log(`   App Type: ${process.env.MicrosoftAppType || 'not set'}`);
-  console.log(`   Tenant: ${process.env.MicrosoftAppTenantId || 'not set'}`);
-  console.log(`   App ID: ${process.env.MicrosoftAppId || 'not set'}`);
-  console.log(`   Workflows loaded: ${workflows.length}`);
-  workflows.forEach((w) => console.log(`     - ${w.name} → ${w.webhookPath}`));
+server.listen(CONFIG.port, () => {
+  console.log(`\n🤖 POD Teams Bot running on port ${CONFIG.port}`);
+  console.log(`   Endpoint: http://localhost:${CONFIG.port}/api/messages`);
+  console.log(`   Hub: ${CONFIG.n8nBaseUrl}${CONFIG.hubPath}`);
+  console.log(`   Ollama model: ${CONFIG.ollamaModel}`);
+  console.log(`   Workflows loaded: ${CONFIG.workflows.length}`);
 });
