@@ -65,6 +65,7 @@ if (CONFIG.workflows.length === 0) {
 const adapter = new BotFrameworkAdapter({
   appId: CONFIG.microsoftAppId,
   appPassword: CONFIG.microsoftAppPassword,
+  channelAuthTenant: process.env.MicrosoftAppTenantId || 'common',
 });
 
 adapter.onTurnError = async (context, error) => {
