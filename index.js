@@ -106,7 +106,6 @@ async function callHub(payload) {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-      timeout: 120000, // 2 min for Ollama responses
     });
 
     if (!response.ok) {
