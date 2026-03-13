@@ -330,7 +330,7 @@ server.post('/api/notify', async (req, res) => {
 });
 
 // --- Health check ---
-server.get('/api/health', (req, res) => {
+server.get('/api/health', async (req, res) => {
   res.send(200, {
     status: 'ok',
     bot: 'POD Teams Bot',
